@@ -48,6 +48,8 @@ KEYWORDS = [
 PAGE_SIZE = 100
 MAX_PAGES = 20                 # safety cap per region
 MAX_ALERTS_PER_RUN = 25        # avoid flooding Telegram; extras are summarised
+CHECK_EVERY = int(os.environ.get("CHECK_EVERY", "90"))    # seconds between checks
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "270"))   # how long one GitHub run keeps checking
 
 API_URL = "https://p-bandai.com/api/search"
 WIDGET_URL = "https://p-bandai.com/api/widget/product/NewArrivalItem"  # fallback (old bot used this)
@@ -218,11 +220,8 @@ def save_state(state: dict) -> None:
 
 
 # ---------------------------------------------------------------- main
-def main() -> int:
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret.")
-        return 1
-
+def check_once(session: requests.Session) -> bool:
+    """One full check of all regions. Returns False if every region failed."""
     previous = load_state()
     first_run = previous is None
     state = dict(previous or {})          # keep entries for regions that fail
@@ -230,8 +229,6 @@ def main() -> int:
     alerts: list[tuple[str, str, dict]] = []
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    session = requests.Session()
-    session.headers["User-Agent"] = USER_AGENT
     ok_regions, failed = [], []
 
     for area in REGIONS:
@@ -260,7 +257,7 @@ def main() -> int:
 
     if not ok_regions:
         print("All regions failed - nothing saved.")
-        return 1  # red X in GitHub so you notice
+        return False
 
     state["_seeded_regions"] = sorted(seeded | set(ok_regions))
     save_state(state)
@@ -272,7 +269,7 @@ def main() -> int:
             "You'll get alerts for new products and restocks."
             + (f"\n⚠️ Not reachable: {', '.join(failed)}" if failed else "")
         )
-        return 0
+        return True
 
     for kind, area, p in alerts[:MAX_ALERTS_PER_RUN]:
         send_alert(kind, area, p)
@@ -281,7 +278,31 @@ def main() -> int:
                   "Check Premium Bandai.")
 
     print(f"Sent {len(alerts)} alert(s). Failed regions: {failed or 'none'}")
-    return 0
+    return True
+
+
+def main() -> int:
+    """Repeat the check every CHECK_EVERY seconds until RUN_SECONDS is used up.
+    GitHub starts a new run every 5 minutes, so this gives ~90-second checks."""
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret.")
+        return 1
+
+    session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
+    deadline = time.monotonic() + RUN_SECONDS
+    any_ok = False
+    n = 0
+    while True:
+        n += 1
+        started = time.monotonic()
+        print(f"--- check #{n} at {datetime.now(timezone.utc):%H:%M:%S} UTC ---")
+        any_ok = check_once(session) or any_ok
+        next_start = started + CHECK_EVERY
+        if next_start + 30 > deadline:      # not enough time left for another check
+            break
+        time.sleep(max(0, next_start - time.monotonic()))
+    return 0 if any_ok else 1               # red X in GitHub if nothing worked
 
 
 if __name__ == "__main__":
